@@ -41,7 +41,7 @@ export function newTask(partial: Partial<Task> = {}): Task {
   };
 }
 
-// ---- Seed data so the first run feels alive (localStorage mode only) ----
+// ---- Seed data so the first run feels alive (only once, when there's no data) ----
 function seedTasks(): Task[] {
   const today = todayYMD();
   const t = (p: Partial<Task>) => newTask(p);
@@ -95,34 +95,47 @@ function seedTasks(): Task[] {
   ];
 }
 
-function loadLocal(): Task[] {
+// Read the local cache without seeding. Used in cloud mode.
+function readCache(): Task[] {
   if (typeof window === "undefined") return [];
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (raw) return JSON.parse(raw) as Task[];
-    if (!window.localStorage.getItem(SEED_KEY)) {
-      const seeded = seedTasks();
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(seeded));
-      window.localStorage.setItem(SEED_KEY, "1");
-      return seeded;
-    }
-    return [];
+    return raw ? (JSON.parse(raw) as Task[]) : [];
   } catch {
     return [];
   }
 }
 
-function logErr(context: string) {
-  return ({ error }: { error: unknown }) => {
-    if (error) console.error(`[supabase:${context}]`, error);
-  };
+function writeCache(tasks: Task[]) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(tasks));
+  } catch {
+    /* ignore quota / private mode */
+  }
+}
+
+// Local-only initial load, seeding on first ever run.
+function loadLocal(): Task[] {
+  if (typeof window === "undefined") return [];
+  const cached = readCache();
+  if (cached.length) return cached;
+  if (!window.localStorage.getItem(SEED_KEY)) {
+    const seeded = seedTasks();
+    writeCache(seeded);
+    window.localStorage.setItem(SEED_KEY, "1");
+    return seeded;
+  }
+  return [];
 }
 
 interface StoreValue {
   tasks: Task[];
   ready: boolean;
-  /** true when syncing with Supabase, false when using local storage only. */
+  /** true when configured to sync with Supabase, false when using local storage only. */
   cloud: boolean;
+  /** true when a Supabase read/write has failed (data still kept locally). */
+  syncError: boolean;
   add: (partial: Partial<Task>) => Task;
   update: (id: string, patch: Partial<Task>) => void;
   remove: (id: string) => void;
@@ -136,6 +149,7 @@ const StoreCtx = createContext<StoreValue | null>(null);
 export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [ready, setReady] = useState(false);
+  const [syncError, setSyncError] = useState(false);
   const tasksRef = useRef<Task[]>([]);
   const firstPersist = useRef(true);
   const cloud = supabase !== null;
@@ -144,21 +158,53 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     tasksRef.current = tasks;
   }, [tasks]);
 
+  const reportErr = useCallback(
+    (context: string) =>
+      ({ error }: { error: unknown }) => {
+        if (error) {
+          console.error(`[supabase:${context}]`, error);
+          setSyncError(true);
+        }
+      },
+    [],
+  );
+
   // ---- Initial load ----
   useEffect(() => {
     let active = true;
+
     if (supabase) {
       const client = supabase;
+      // 1) Show the local cache instantly so a refresh never looks empty.
+      const cached = readCache();
+      if (cached.length) setTasks(cached);
+
+      // 2) Reconcile with the server.
       client
         .from(TASKS_TABLE)
         .select("*")
         .then(({ data, error }) => {
           if (!active) return;
-          if (error) console.error("[supabase:load]", error);
-          if (data) setTasks(data.map(rowToTask));
+          if (error) {
+            console.error("[supabase:load]", error);
+            setSyncError(true);
+            setReady(true);
+            return; // keep the cached data
+          }
+          const server = (data ?? []).map(rowToTask);
+          const serverIds = new Set(server.map((t) => t.id));
+          // Rows that only exist locally → push them up (self-heal after downtime).
+          const localOnly = cached.filter((t) => !serverIds.has(t.id));
+          const merged = [...server, ...localOnly];
+          setTasks(merged);
+          writeCache(merged);
+          for (const t of localOnly) {
+            client.from(TASKS_TABLE).upsert(taskToRow(t)).then(reportErr("heal"));
+          }
           setReady(true);
         });
 
+      // 3) Realtime: keep devices in sync.
       const channel = client
         .channel("tasks-sync")
         .on(
@@ -166,14 +212,18 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           { event: "*", schema: "public", table: TASKS_TABLE },
           (payload) => {
             setTasks((prev) => {
+              let next: Task[];
               if (payload.eventType === "DELETE") {
                 const id = (payload.old as { id?: string }).id;
-                return prev.filter((t) => t.id !== id);
+                next = prev.filter((t) => t.id !== id);
+              } else {
+                const row = rowToTask(payload.new);
+                next = prev.some((t) => t.id === row.id)
+                  ? prev.map((t) => (t.id === row.id ? row : t))
+                  : [...prev, row];
               }
-              const row = rowToTask(payload.new);
-              return prev.some((t) => t.id === row.id)
-                ? prev.map((t) => (t.id === row.id ? row : t))
-                : [...prev, row];
+              writeCache(next);
+              return next;
             });
           },
         )
@@ -184,29 +234,26 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         client.removeChannel(channel);
       };
     }
+
     // Local-only mode.
     setTasks(loadLocal());
     setReady(true);
     return () => {
       active = false;
     };
-  }, []);
+  }, [reportErr]);
 
-  // ---- Persist to localStorage (local mode only) ----
+  // ---- Persist to localStorage on every change (both modes: acts as cache) ----
   useEffect(() => {
-    if (!ready || cloud) return;
+    if (!ready) return;
     if (firstPersist.current) {
       firstPersist.current = false;
       return;
     }
-    try {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(tasks));
-    } catch {
-      /* ignore quota / private mode */
-    }
-  }, [tasks, ready, cloud]);
+    writeCache(tasks);
+  }, [tasks, ready]);
 
-  // ---- Cross-tab sync (local mode) ----
+  // ---- Cross-tab sync (local mode only; cloud uses realtime) ----
   useEffect(() => {
     if (cloud) return;
     const onStorage = (e: StorageEvent) => {
@@ -222,13 +269,19 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     return () => window.removeEventListener("storage", onStorage);
   }, [cloud]);
 
-  // ---- Cloud helpers ----
-  const pushUpsert = useCallback((task: Task) => {
-    if (supabase) supabase.from(TASKS_TABLE).upsert(taskToRow(task)).then(logErr("upsert"));
-  }, []);
-  const pushDelete = useCallback((id: string) => {
-    if (supabase) supabase.from(TASKS_TABLE).delete().eq("id", id).then(logErr("delete"));
-  }, []);
+  // ---- Cloud write helpers ----
+  const pushUpsert = useCallback(
+    (task: Task) => {
+      if (supabase) supabase.from(TASKS_TABLE).upsert(taskToRow(task)).then(reportErr("upsert"));
+    },
+    [reportErr],
+  );
+  const pushDelete = useCallback(
+    (id: string) => {
+      if (supabase) supabase.from(TASKS_TABLE).delete().eq("id", id).then(reportErr("delete"));
+    },
+    [reportErr],
+  );
 
   // ---- Mutations (optimistic local + cloud write) ----
   const add = useCallback(
@@ -312,15 +365,16 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     const doneIds = tasksRef.current.filter((t) => t.status === "done").map((t) => t.id);
     setTasks((prev) => prev.filter((t) => t.status !== "done"));
     if (supabase && doneIds.length) {
-      supabase.from(TASKS_TABLE).delete().in("id", doneIds).then(logErr("clearCompleted"));
+      supabase.from(TASKS_TABLE).delete().in("id", doneIds).then(reportErr("clearCompleted"));
     }
-  }, []);
+  }, [reportErr]);
 
   const value = useMemo<StoreValue>(
     () => ({
       tasks,
       ready,
       cloud,
+      syncError,
       add,
       update,
       remove,
@@ -328,7 +382,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       reorder,
       clearCompleted,
     }),
-    [tasks, ready, cloud, add, update, remove, toggleDone, reorder, clearCompleted],
+    [tasks, ready, cloud, syncError, add, update, remove, toggleDone, reorder, clearCompleted],
   );
 
   return <StoreCtx.Provider value={value}>{children}</StoreCtx.Provider>;

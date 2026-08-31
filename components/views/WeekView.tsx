@@ -139,13 +139,13 @@ export function WeekView() {
                     >
                       <Checkbox size="sm" done={false} onToggle={() => toggleDone(t.id)} />
                     </span>
-                    <span className="min-w-0 flex-1">
+                    <span className="line-clamp-2 min-w-0 flex-1 text-[13px] leading-snug text-ink">
                       {t.time && (
-                        <span className="mr-1 text-[11px] font-semibold tabular-nums text-zinc-400">
+                        <span className="mr-1 font-semibold tabular-nums text-zinc-400">
                           {t.time}
                         </span>
                       )}
-                      <span className="text-[13px] leading-tight text-ink">{t.title}</span>
+                      {t.title}
                     </span>
                     <PriorityDot priority={t.priority} />
                   </button>

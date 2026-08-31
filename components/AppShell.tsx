@@ -27,7 +27,7 @@ const NAV = [
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const { openCompose } = useUI();
-  const { tasks, cloud } = useStore();
+  const { tasks, cloud, syncError } = useStore();
 
   const inboxCount = tasks.filter((t) => t.status === "inbox").length;
 
@@ -61,12 +61,14 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           </Link>
           <span
             title={
-              cloud
-                ? "Sincronizado con Supabase"
-                : "Guardado en este navegador (sin sincronización)"
+              !cloud
+                ? "Guardado en este navegador (sin sincronización)"
+                : syncError
+                  ? "Error de sincronización con Supabase — revisa que la tabla exista. Tus datos siguen guardados en este navegador."
+                  : "Sincronizado con Supabase"
             }
             className={`hidden h-1.5 w-1.5 rounded-full sm:block ${
-              cloud ? "bg-emerald-400" : "bg-zinc-300"
+              !cloud ? "bg-zinc-300" : syncError ? "bg-amber-400" : "bg-emerald-400"
             }`}
           />
 
