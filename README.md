@@ -24,11 +24,27 @@ Herramienta web personal para gestionar el día a día — pensada para sentirse
 - **Tailwind CSS** para el diseño
 - Sin librerías extra: drag & drop nativo (HTML5) y parser de fechas en español propio (`lib/nlp.ts`)
 
-## Persistencia
+## Persistencia — Supabase (con fallback a localStorage)
 
-Los datos se guardan en **`localStorage`** del navegador (clave `agenda.tasks.v1`). Sobreviven a los refrescos y sincronizan entre pestañas del mismo navegador.
+La app usa **Supabase** (Postgres) como base de datos real, con **sincronización en tiempo real entre dispositivos**. Si las variables de entorno de Supabase no están definidas, funciona igualmente guardando en **`localStorage`** del navegador — así nunca se rompe.
 
-El modelo de datos (`lib/types.ts`) es una única entidad `Task` diseñada para migrar sin fricción a una base de datos real (Vercel Postgres, Supabase…) más adelante: bastará con sustituir la capa de `lib/store.tsx` por llamadas a una API, sin tocar la UI. Esto habilitará sincronización entre dispositivos, y en el futuro categorías, proyectos, Google Calendar, notificaciones, IA o captura desde email.
+Un punto verde/gris junto al logo indica el estado: **verde = sincronizado con Supabase**, gris = solo local.
+
+> ⚠️ **Acceso abierto por URL (sin login)**, según lo solicitado. La `anon key` es pública y las políticas RLS permiten lectura/escritura a cualquiera. Quien conozca la URL de la app puede ver y editar las tareas. Para privacidad real más adelante, añadir Supabase Auth y filtrar las políticas por `auth.uid()`.
+
+### Puesta en marcha de Supabase
+
+1. Crea un proyecto en [supabase.com](https://supabase.com).
+2. En **SQL Editor**, pega y ejecuta el contenido de [`supabase/schema.sql`](supabase/schema.sql).
+3. En **Project Settings → API**, copia el **Project URL** y la **anon public key**.
+4. Añade estas variables en **Vercel** (Project Settings → Environment Variables) y en tu `.env.local` para desarrollo:
+   ```
+   NEXT_PUBLIC_SUPABASE_URL=https://TU-PROYECTO.supabase.co
+   NEXT_PUBLIC_SUPABASE_ANON_KEY=tu-anon-public-key
+   ```
+5. Redeploy en Vercel. El punto junto al logo se pondrá verde.
+
+El modelo de datos es una única entidad `Task` (`lib/types.ts` ↔ tabla `tasks`), preparada para evolucionar hacia categorías, proyectos, Google Calendar, notificaciones, IA o captura desde email.
 
 ## Estructura
 

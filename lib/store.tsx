@@ -11,6 +11,7 @@ import {
 } from "react";
 import { addDays, todayYMD } from "./dates";
 import { nextOccurrence } from "./recurrence";
+import { TASKS_TABLE, rowToTask, supabase, taskToRow } from "./supabase";
 import type { Priority, Status, Task } from "./types";
 
 const STORAGE_KEY = "agenda.tasks.v1";
@@ -40,7 +41,7 @@ export function newTask(partial: Partial<Task> = {}): Task {
   };
 }
 
-// ---- Seed data so the first run feels alive (only once) ----
+// ---- Seed data so the first run feels alive (localStorage mode only) ----
 function seedTasks(): Task[] {
   const today = todayYMD();
   const t = (p: Partial<Task>) => newTask(p);
@@ -66,29 +67,15 @@ function seedTasks(): Task[] {
         { id: uid(), text: "Preparar feedback", done: false },
       ],
     }),
-    t({
-      title: "Revisar feedback de Operations",
-      date: today,
-      status: "todo",
-    }),
-    t({
-      title: "Preparar roadmap Q4",
-      date: today,
-      status: "todo",
-      priority: "medium",
-    }),
+    t({ title: "Revisar feedback de Operations", date: today, status: "todo" }),
+    t({ title: "Preparar roadmap Q4", date: today, status: "todo", priority: "medium" }),
     t({
       title: "Revisar métricas semanales",
       date: today,
       status: "todo",
       recurrence: { freq: "weekly", interval: 1 },
     }),
-    t({
-      title: "Planning de producto",
-      date: addDays(today, 2),
-      time: "10:30",
-      status: "todo",
-    }),
+    t({ title: "Planning de producto", date: addDays(today, 2), time: "10:30", status: "todo" }),
     t({
       title: "1:1 con Edu",
       date: addDays(today, 3),
@@ -108,12 +95,11 @@ function seedTasks(): Task[] {
   ];
 }
 
-function load(): Task[] {
+function loadLocal(): Task[] {
   if (typeof window === "undefined") return [];
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
     if (raw) return JSON.parse(raw) as Task[];
-    // First ever run: seed.
     if (!window.localStorage.getItem(SEED_KEY)) {
       const seeded = seedTasks();
       window.localStorage.setItem(STORAGE_KEY, JSON.stringify(seeded));
@@ -126,9 +112,17 @@ function load(): Task[] {
   }
 }
 
+function logErr(context: string) {
+  return ({ error }: { error: unknown }) => {
+    if (error) console.error(`[supabase:${context}]`, error);
+  };
+}
+
 interface StoreValue {
   tasks: Task[];
   ready: boolean;
+  /** true when syncing with Supabase, false when using local storage only. */
+  cloud: boolean;
   add: (partial: Partial<Task>) => Task;
   update: (id: string, patch: Partial<Task>) => void;
   remove: (id: string) => void;
@@ -142,16 +136,65 @@ const StoreCtx = createContext<StoreValue | null>(null);
 export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [ready, setReady] = useState(false);
+  const tasksRef = useRef<Task[]>([]);
   const firstPersist = useRef(true);
+  const cloud = supabase !== null;
 
   useEffect(() => {
-    setTasks(load());
+    tasksRef.current = tasks;
+  }, [tasks]);
+
+  // ---- Initial load ----
+  useEffect(() => {
+    let active = true;
+    if (supabase) {
+      const client = supabase;
+      client
+        .from(TASKS_TABLE)
+        .select("*")
+        .then(({ data, error }) => {
+          if (!active) return;
+          if (error) console.error("[supabase:load]", error);
+          if (data) setTasks(data.map(rowToTask));
+          setReady(true);
+        });
+
+      const channel = client
+        .channel("tasks-sync")
+        .on(
+          "postgres_changes",
+          { event: "*", schema: "public", table: TASKS_TABLE },
+          (payload) => {
+            setTasks((prev) => {
+              if (payload.eventType === "DELETE") {
+                const id = (payload.old as { id?: string }).id;
+                return prev.filter((t) => t.id !== id);
+              }
+              const row = rowToTask(payload.new);
+              return prev.some((t) => t.id === row.id)
+                ? prev.map((t) => (t.id === row.id ? row : t))
+                : [...prev, row];
+            });
+          },
+        )
+        .subscribe();
+
+      return () => {
+        active = false;
+        client.removeChannel(channel);
+      };
+    }
+    // Local-only mode.
+    setTasks(loadLocal());
     setReady(true);
+    return () => {
+      active = false;
+    };
   }, []);
 
-  // Persist on every change (after initial load).
+  // ---- Persist to localStorage (local mode only) ----
   useEffect(() => {
-    if (!ready) return;
+    if (!ready || cloud) return;
     if (firstPersist.current) {
       firstPersist.current = false;
       return;
@@ -161,10 +204,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     } catch {
       /* ignore quota / private mode */
     }
-  }, [tasks, ready]);
+  }, [tasks, ready, cloud]);
 
-  // Sync across tabs.
+  // ---- Cross-tab sync (local mode) ----
   useEffect(() => {
+    if (cloud) return;
     const onStorage = (e: StorageEvent) => {
       if (e.key === STORAGE_KEY && e.newValue) {
         try {
@@ -176,43 +220,71 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     };
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);
+  }, [cloud]);
+
+  // ---- Cloud helpers ----
+  const pushUpsert = useCallback((task: Task) => {
+    if (supabase) supabase.from(TASKS_TABLE).upsert(taskToRow(task)).then(logErr("upsert"));
+  }, []);
+  const pushDelete = useCallback((id: string) => {
+    if (supabase) supabase.from(TASKS_TABLE).delete().eq("id", id).then(logErr("delete"));
   }, []);
 
-  const add = useCallback((partial: Partial<Task>) => {
-    const task = newTask(partial);
-    setTasks((prev) => [...prev, task]);
-    return task;
-  }, []);
+  // ---- Mutations (optimistic local + cloud write) ----
+  const add = useCallback(
+    (partial: Partial<Task>) => {
+      const task = newTask(partial);
+      setTasks((prev) => [...prev, task]);
+      pushUpsert(task);
+      return task;
+    },
+    [pushUpsert],
+  );
 
-  const update = useCallback((id: string, patch: Partial<Task>) => {
-    setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, ...patch } : t)));
-  }, []);
+  const update = useCallback(
+    (id: string, patch: Partial<Task>) => {
+      const cur = tasksRef.current.find((t) => t.id === id);
+      if (!cur) return;
+      const updated = { ...cur, ...patch };
+      setTasks((prev) => prev.map((t) => (t.id === id ? updated : t)));
+      pushUpsert(updated);
+    },
+    [pushUpsert],
+  );
 
-  const remove = useCallback((id: string) => {
-    setTasks((prev) => prev.filter((t) => t.id !== id));
-  }, []);
+  const remove = useCallback(
+    (id: string) => {
+      setTasks((prev) => prev.filter((t) => t.id !== id));
+      pushDelete(id);
+    },
+    [pushDelete],
+  );
 
-  const reorder = useCallback((id: string, order: number) => {
-    setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, order } : t)));
-  }, []);
+  const reorder = useCallback(
+    (id: string, order: number) => {
+      const cur = tasksRef.current.find((t) => t.id === id);
+      if (!cur) return;
+      const updated = { ...cur, order };
+      setTasks((prev) => prev.map((t) => (t.id === id ? updated : t)));
+      pushUpsert(updated);
+    },
+    [pushUpsert],
+  );
 
-  const toggleDone = useCallback((id: string) => {
-    setTasks((prev) => {
-      const target = prev.find((t) => t.id === id);
-      if (!target) return prev;
+  const toggleDone = useCallback(
+    (id: string) => {
+      const target = tasksRef.current.find((t) => t.id === id);
+      if (!target) return;
       const completing = target.status !== "done";
-      const next = prev.map((t) =>
-        t.id === id
-          ? {
-              ...t,
-              status: (completing ? "done" : t.date ? "todo" : "inbox") as Status,
-              completedAt: completing ? new Date().toISOString() : null,
-            }
-          : t,
-      );
-      // If completing a recurring task with a date, spawn the next occurrence.
+      const updated: Task = {
+        ...target,
+        status: (completing ? "done" : target.date ? "todo" : "inbox") as Status,
+        completedAt: completing ? new Date().toISOString() : null,
+      };
+
+      let spawned: Task | null = null;
       if (completing && target.recurrence && target.date) {
-        const upcoming = newTask({
+        spawned = newTask({
           title: target.title,
           date: nextOccurrence(target.date, target.recurrence),
           time: target.time,
@@ -221,23 +293,42 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           priority: target.priority,
           tags: [...target.tags],
           checklist: target.checklist.map((c) => ({ ...c, done: false })),
-          dueDate: null,
           recurrence: target.recurrence,
           order: target.order,
         });
-        return [...next, upcoming];
       }
-      return next;
-    });
-  }, []);
+
+      setTasks((prev) => {
+        const next = prev.map((t) => (t.id === id ? updated : t));
+        return spawned ? [...next, spawned] : next;
+      });
+      pushUpsert(updated);
+      if (spawned) pushUpsert(spawned);
+    },
+    [pushUpsert],
+  );
 
   const clearCompleted = useCallback(() => {
+    const doneIds = tasksRef.current.filter((t) => t.status === "done").map((t) => t.id);
     setTasks((prev) => prev.filter((t) => t.status !== "done"));
+    if (supabase && doneIds.length) {
+      supabase.from(TASKS_TABLE).delete().in("id", doneIds).then(logErr("clearCompleted"));
+    }
   }, []);
 
   const value = useMemo<StoreValue>(
-    () => ({ tasks, ready, add, update, remove, toggleDone, reorder, clearCompleted }),
-    [tasks, ready, add, update, remove, toggleDone, reorder, clearCompleted],
+    () => ({
+      tasks,
+      ready,
+      cloud,
+      add,
+      update,
+      remove,
+      toggleDone,
+      reorder,
+      clearCompleted,
+    }),
+    [tasks, ready, cloud, add, update, remove, toggleDone, reorder, clearCompleted],
   );
 
   return <StoreCtx.Provider value={value}>{children}</StoreCtx.Provider>;

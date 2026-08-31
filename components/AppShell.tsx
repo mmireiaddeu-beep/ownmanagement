@@ -27,7 +27,7 @@ const NAV = [
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const { openCompose } = useUI();
-  const { tasks } = useStore();
+  const { tasks, cloud } = useStore();
 
   const inboxCount = tasks.filter((t) => t.status === "inbox").length;
 
@@ -59,6 +59,16 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           <Link href="/" className="flex items-center gap-2 font-serif text-lg text-ink">
             <span className="text-accent">◆</span> Agenda
           </Link>
+          <span
+            title={
+              cloud
+                ? "Sincronizado con Supabase"
+                : "Guardado en este navegador (sin sincronización)"
+            }
+            className={`hidden h-1.5 w-1.5 rounded-full sm:block ${
+              cloud ? "bg-emerald-400" : "bg-zinc-300"
+            }`}
+          />
 
           <nav className="ml-2 hidden items-center gap-1 sm:flex">
             {NAV.map((item) => (
