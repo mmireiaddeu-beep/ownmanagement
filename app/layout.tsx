@@ -5,6 +5,12 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: "Agenda",
   description: "Tu agenda personal — captura, organiza y sabe qué hacer hoy.",
+  manifest: "/manifest.webmanifest",
+  appleWebApp: {
+    capable: true,
+    title: "Agenda",
+    statusBarStyle: "default",
+  },
 };
 
 export const viewport: Viewport = {
